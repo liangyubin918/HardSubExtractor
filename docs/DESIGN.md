@@ -45,12 +45,17 @@ $BIN --extract testdata/tiny.mp4 out.srt --engine paddle
 |---|---|
 | `--make-sample <输出.mp4>` | 生成测试视频，可加 `--hard` / `--tiny` / `--faint` / `--bilingual` / `--dense` |
 | `--extract <视频> [输出.srt]` | 提取字幕，省略输出路径则打印到终端 |
+| `--recover <流水账\|视频> [输出.srt]` | 从中断留下的流水账聚合出部分结果 |
 | `--engine vision\|paddle` | 选择 OCR 引擎，默认 vision |
 | `--fps <帧率>` | 采样帧率，默认 10（`--interval` 仍兼容） |
 | `--roi <上,下>` | 字幕区域纵向范围，默认 `0.72,0.98` |
 | `--interval <秒>` | 抽帧最小间隔，默认 `0.10` |
+| `--no-snap` / `--no-refine` | 关闭语音边界吸附 / 文本清洗（两者默认开启） |
 | `--verbose` | 打印每一帧的观测结果 |
 | `--probe <视频> [秒]` | 单帧探测：取帧 → 裁剪 → OCR，输出中间量 |
+| `--probe-audio <视频>` | 音频包络与语音段检测（吸附调参用） |
+| `--refine-text <文本>` | 文本清洗试算 |
+| `--check-update` | 检查 GitHub Releases 新版本 |
 | `--selftest <视频>` | 无界面驱动 GUI 用的那套 ViewModel，验证交互路径 |
 | `--render-ui <输出.png>` | 离屏渲染界面快照（布局自检用） |
 
@@ -239,13 +244,18 @@ Sources/
 └── HardSubExtractor/
     ├── App/
     │   ├── ApplicationEntry.swift      入口，先判断命令行再决定是否进 GUI
-    │   └── CommandLineRunner.swift     extract / probe / make-sample / render-ui
+    │   ├── CommandLineRunner.swift     extract / recover / probe / make-sample / render-ui
+    │   ├── AppVersion.swift            版本号唯一来源（make-app.sh 从这里读）
+    │   └── UpdateService.swift         GitHub Releases 更新检查（唯一的网络调用）
     ├── Models/
     │   ├── SubtitleAnchor.swift        字幕行锚点 + 语种判定
     ├── Pipeline/
     │   ├── VideoFrameSampler.swift     AVAssetReader 顺序解码 + 时间维抽稀
     │   ├── PixelToolkit.swift          ROI 裁剪 / 放大 / dHash 感知哈希
     │   ├── AnchorDetector.swift        扫描片头，自动发现字幕行（锚点）
+    │   ├── AudioEnvelope.swift         音频 → 12kHz 能量包络（流式，内存只有包络）
+    │   ├── SpeechSnapper.swift         能量 VAD + 字幕边界吸附
+    │   ├── ExtractionSpool.swift       提取流水账（JSONL，中断可恢复）
     │   ├── BGRAImage.swift             CVPixelBuffer → 紧凑字节数组 + 双线性采样 + NCHW 归一化
     │   ├── OnnxSession.swift           onnxruntime 会话封装
     │   ├── SubtitleRecognizer.swift    OCR 引擎协议
@@ -254,6 +264,7 @@ Sources/
     │   ├── SubtitleAggregator.swift    逐行聚合 → 跨行合并 → 时间轴 ★最容易做砸
     │   └── ExtractionEngine.swift      管线编排
     ├── Export/SubtitleExporter.swift
+    ├── Export/TextRefiner.swift        OCR 文本清洗（标点/空格/缩略语，按语种分流）
     ├── ViewModels/  Views/
     └── DevTools/SampleVideoGenerator.swift
 
@@ -266,7 +277,9 @@ Vendor/onnxruntime/lib/               libonnxruntime.1.dylib 32MB
 ```
 分析字幕行（扫片头）→ 得到 N 条锚点
         ↓
-解码 → 逐行 dHash 判重 → 变化行才 OCR → 变化后补几帧投票 → 逐行聚合 → 跨行合并 → 时间轴 → 导出
+解码 → 逐行 dHash 判重 → 变化行才 OCR → 变化后补几帧投票（观测即时落盘流水账）
+        ↓
+逐行聚合 → 跨行合并 → 时间轴 → 语音边界吸附 → 文本清洗 → 导出
 ```
 
 ### 关键设计决策
@@ -351,9 +364,72 @@ v4 单字置信度更高（0.999 vs 0.98），但在小字上更容易切碎行�
 
 ---
 
+## 吸附、清洗与断点恢复
+
+这三样都是看 VSE（video-subtitle-extractor）踩过的坑抄来的，各自对付一类「结果不可信 / 不完整」。
+
+### 语音边界吸附（SpeechSnapper）
+
+字幕时间轴精度受抽帧间隔限制（默认 0.1s），而字幕出现/消失几乎总是和开口/停顿对齐。
+做法：FFmpeg 子进程把音轨压成 12kHz 单声道 PCM（流式读取，内存里只有包络，2 小时 ≈ 2.9MB），
+按 10ms hop 算 RMS 能量；能量 VAD（迟滞：进入 +12dB / 退出 +7dB，最短语音 120ms、
+静音桥接 100ms）得到语音段；再把每条字幕的起止吸附到 ±0.35s 内最近的语音边界。
+只小步挪（≥0.04s 才动、不与邻段交叉、吸附后短于 0.05s 就放弃），OCR 的判定仍然说了算。
+
+**一个当场踩到的坑**：噪声底最初取能量的 20 分位——对白密集的片子里静音占比低于 20%，
+分位数落在语音能量上，阈值高到什么都检不出来（测试样本 88% 都是语音，当场复现）。
+修法是再算一个「中位数 − 20dB」兜底，取两者更低。
+
+实测：给样本造语音突发（每条字幕边界错位 ±0.18s），吸附后 8 条边界全部贴合突发沿
+（10ms 量化级）；`--no-snap` 与旧行为逐字节一致；无音轨自动跳过。音频特征的处理方式
+参考 sushi（12kHz 包络、能量归一化），但只做自我精修，不做跨视频模板匹配——
+波形图 UI 将来可以直接复用这份包络。
+
+### 文本清洗（TextRefiner）
+
+移植 VSE `reformat.py` 的无分词子集：51 条缩略语（im→I'm、dont→don't…）+ 5 条错字映射
++ 标点/空格正则链。三处有意与 VSE 不同：
+
+1. **不移植 wordsegment 分词 DP** —— 要把 ~3MB 词频数据打进包，服务的场景占比太低；
+2. **不移植 CamelCase 拆词** —— iPhone / McDonald 的误伤面比粘连词大；
+3. **全角标点不分语种一律转半角是 VSE 的缺陷**，本项目按整段语种分流
+   （`SubtitleLanguage.classify`）：中文行保留全角正字法，只去标点前空格和汉字间的
+   OCR 噪声空格；西文行走完整链（全角→半角、标点后补空格）。
+
+另外：its / id / wed 本身是英文单词，从缩略语表里排除——VSE 靠分词器上下文规避这个问题，
+我们没有分词器，只能显式排除。`--refine-text` 可以直接试算；GUI 参数面板两个开关
+（吸附 / 清洗）默认都开。
+
+### 断点恢复（ExtractionSpool）
+
+VSE 的事故：OCR 结果攒在子进程内存、只在 finally 落盘，进程被杀全部丢失
+（其 issue #481「後半部字幕丟失」的成因之一）。本项目把观测做成 JSONL 流水账，
+一产生就追加写盘并 fsync：首行是 header（锚点定义 + 时长，恢复聚合不需要重扫片头），
+之后每行一条观测。落盘位置优先视频同目录 `<stem>.hsub-partial.jsonl`（找得到也删得掉），
+不可写则降级到应用支持目录。
+
+- 正常完成 / 失败：流水账删除。
+- 手动停止：GUI 直接从磁盘读回聚合——之前停止会取消消费端 Task，引擎聚合好的
+  部分结果事件送达不了，等于白算；现在停止后一定有部分结果。
+- 崩溃 / 断电：下次载入同一视频，状态条出现「恢复上次提取」。
+- CLI：`--recover <流水账|视频> [输出.srt]`。
+
+kill -9 实测：提取中途杀进程 → 流水账存活 → `--recover` 聚合出部分 SRT → 流水账消费删除。
+
+### 更新检查（UpdateService）
+
+整个应用唯一的网络调用：查 GitHub Releases 的 tag_name 与 `AppVersion.current` 比较
+（逐段数值比较，2.10.0 > 2.9.0），5 秒超时，任何失败静默降级。发现新版本弹窗跳转
+Releases 页面，不做应用内下载。启动自动检查默认关闭（键 `checkUpdateOnStartup`），
+帮助菜单可手动「检查更新…」。版本号唯一来源是 `App/AppVersion.swift`，make-app.sh
+从那里读出来写进 Info.plist——版本元数据与代码不再可能漂移。
+
+---
+
 ## 已知限制
 
-- **时间轴精度 ±0.1s**：受抽帧间隔限制。调到 0.04s 可提升，代价是慢 2.5 倍。
+- **时间轴精度**：抽帧间隔 ±0.1s；开启语音吸附后边界贴合语音起止（10ms 量级）。
+  纯音乐 / 无音轨片源自动跳过吸附。调密采样（0.04s）仍可进一步提升吸附前的起点质量。
 - **双语字幕**按行合并成一条（换行分隔），没有自动拆成两条独立字幕。
 - **滚动字幕 / 卡拉OK 逐字变色**会被判成连续变化，可能产生大量碎片。
 - **应用体积 93MB**：FFmpeg 48MB + onnxruntime 32MB + 模型 13MB。
@@ -393,9 +469,13 @@ HS_DEBUG_MEMORY=1 "./build/硬字幕提取器.app/Contents/MacOS/HardSubExtracto
 
 已验证：两个引擎在四种难度样本上的端到端提取、SRT 生成、缺库降级、
 GUI 的 ViewModel 路径（`--selftest` 驱动 `load → start → segments → 导出` 全流程）、
-窗口正常渲染与长时间稳定运行、界面布局与字幕区域框的几何（离屏渲染 + 逐像素校验）。
+窗口正常渲染与长时间稳定运行、界面布局与字幕区域框的几何（离屏渲染 + 逐像素校验）、
+语音吸附端到端（含音轨样本 8 条边界贴合突发沿）、文本清洗按语种分流、
+kill -9 中途 `--recover` 恢复、新功能默认开启下与 golden sample.srt 逐字节一致、
+make-app.sh 版本注入。
 
-未验证：真实鼠标交互（文件选择器弹窗、行内文本编辑、保存面板、快捷键）。
+未验证：真实鼠标交互（文件选择器弹窗、行内文本编辑、保存面板、快捷键）、
+状态条「恢复上次提取」按钮与更新弹窗的点击（与既有 GUI 控件同一限制）。
 开发环境的屏幕录制权限受限，无法点击验证，只能靠代码路径覆盖。
 离屏渲染也有盲区：TextField、Button、Slider、ProgressView、ScrollView 都是 AppKit 支撑的，
 在快照里会渲染成占位块，所以这些控件的实际观感需要你打开应用确认。
@@ -404,9 +484,10 @@ GUI 的 ViewModel 路径（`--selftest` 驱动 `load → start → segments → 
 
 1. 双语字幕自动分行（按 y 坐标聚类 + 语言检测）
 2. 批量队列：一次拖入多集，后台串行处理
-3. 时间轴微调：拖动字幕条 + 波形图辅助对齐
-4. 导出 ASS，保留字号、颜色、位置
-5. 用真实片源跑一轮评测，替换合成样本的结论
+3. 时间轴微调：拖动字幕条 + 波形图辅助对齐（`AudioEnvelope` 的包络数据可直接喂波形图）
+4. 跨版本字幕对齐（sushi 式双音频模板匹配），作为可选项补齐「从别的版本搬运字幕」场景
+5. 导出 ASS，保留字号、颜色、位置
+6. 用真实片源跑一轮评测，替换合成样本的结论
 
 ## 第三方组件
 

@@ -22,6 +22,11 @@ struct ExtractionConfig {
     /// 逐行判重会把 OCR 次数压到最低，但也失去了多帧投票；
     /// 变化后补几帧能把准确率补回来，代价仍然远小于逐帧识别。
     var voteFrames: Int = 3
+    /// 导出前把字幕段边界吸附到语音活动边界（改善 ±0.1s 的抽帧间隔精度）。
+    /// 无音轨或检测不到语音时自动空转。
+    var snapToSpeech: Bool = true
+    /// 导出前应用文本清洗（标点/空格/缩略语，见 TextRefiner）
+    var refineText: Bool = true
 
     var minInterval: Double { fps > 0 ? 1.0 / fps : 0.1 }
 
@@ -54,7 +59,8 @@ enum ExtractionEngine {
 
     static func run(url: URL,
                     config: ExtractionConfig,
-                    recognizer: any SubtitleRecognizer) -> AsyncStream<ExtractionEvent> {
+                    recognizer: any SubtitleRecognizer,
+                    spool: ExtractionSpool? = nil) -> AsyncStream<ExtractionEvent> {
         AsyncStream { continuation in
             let task = Task.detached(priority: .userInitiated) {
                 do {
@@ -156,6 +162,7 @@ enum ExtractionEngine {
                                                              text: text,
                                                              confidence: confidence)
                             observations.append(observation)
+                            spool?.append(observation)
                             continuation.yield(.observation(observation))
                         }
                     }
@@ -177,35 +184,64 @@ enum ExtractionEngine {
                     // 中间又没有新观测的字幕（静止画面上很常见），段尾会被截短到投票帧。
                     if let closingTime = lastFrameEnd {
                         for anchor in anchors {
-                            observations.append(OCRObservation(anchorID: anchor.id,
-                                                               time: closingTime,
-                                                               frameEnd: closingTime,
-                                                               text: "",
-                                                               confidence: 0))
+                            let closing = OCRObservation(anchorID: anchor.id,
+                                                         time: closingTime,
+                                                         frameEnd: closingTime,
+                                                         text: "",
+                                                         confidence: 0)
+                            observations.append(closing)
+                            spool?.append(closing)
                         }
                     }
 
-                    let segments = SubtitleAggregator.aggregate(observations,
-                                                               anchors: anchors,
-                                                               totalDuration: duration)
+                    var segments = SubtitleAggregator.aggregate(observations,
+                                                                anchors: anchors,
+                                                                totalDuration: duration)
                     // 解码过程中出过错（文件局部损坏）但解出过帧：结果照常给，文案里提示
                     let warning = (await reader.hadDecodeErrors() && !segments.isEmpty)
                         ? "（源文件有损坏，结果可能不完整）" : ""
 
+                    // 后处理两步都可能改变结果，但失败的代价只是「少修一次」：
+                    // 音轨缺失/被取消就跳过吸附，文本清洗始终是纯内存操作。
+                    var postNote = ""
+                    if config.snapToSpeech, !Task.isCancelled {
+                        if let envelope = await AudioEnvelope.load(url: url) {
+                            let speech = SpeechSnapper.speechSegments(from: envelope)
+                            let (snapped, adjusted) = SpeechSnapper.snap(segments,
+                                                                         speech: speech,
+                                                                         totalDuration: duration)
+                            if adjusted > 0 {
+                                segments = snapped
+                                postNote = "，语音吸附 \(adjusted) 处"
+                            }
+                        }
+                    }
+                    if config.refineText {
+                        segments = segments.map { segment in
+                            var refined = segment
+                            refined.text = TextRefiner.refine(segment.text)
+                            return refined
+                        }
+                    }
+
                     if Task.isCancelled {
-                        // 手动停止：已识别的部分结果照常聚合交付，不再丢弃
+                        // 手动停止：已识别的部分结果照常聚合交付；流水账保留在磁盘上，
+                        // 消费端已取消、这个事件送达不了时，ViewModel 会直接从 spool 恢复。
                         let note = segments.isEmpty
                             ? "已停止，没有可保留的结果"
                             : "已手动停止，保留 \(segments.count) 条部分结果\(warning)"
+                        spool?.close()
                         continuation.yield(.finished(segments, completed: false, note: note))
                         continuation.finish()
                         return
                     }
 
+                    spool?.closeAndRemove()
                     continuation.yield(.finished(segments, completed: true,
-                                                 note: "完成，共 \(segments.count) 条字幕\(warning)"))
+                                                 note: "完成，共 \(segments.count) 条字幕\(postNote)\(warning)"))
                     continuation.finish()
                 } catch {
+                    spool?.closeAndRemove()
                     continuation.yield(.failed(error.localizedDescription))
                     continuation.finish()
                 }

@@ -45,7 +45,15 @@ if [ -f "$ORT_LIB" ]; then
     echo "    onnxruntime：$(du -sh "$ORT_LIB" | cut -f1)"
 fi
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+# 版本号唯一来源：Sources/HardSubExtractor/App/AppVersion.swift（改版本只改那一行），
+# 避免脚本和代码两处漂移（VSE 的教训之一：版本元数据与代码脱节）。
+APP_VERSION="$(sed -n 's/^    static let current = "\(.*\)"$/\1/p' "$ROOT/Sources/HardSubExtractor/App/AppVersion.swift" | head -1)"
+if [ -z "$APP_VERSION" ]; then
+    echo "无法从 AppVersion.swift 解析版本号" >&2
+    exit 1
+fi
+
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -63,9 +71,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.2.0</string>
+    <string>${APP_VERSION}</string>
     <key>CFBundleVersion</key>
-    <string>2</string>
+    <string>3</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>NSHighResolutionCapable</key>

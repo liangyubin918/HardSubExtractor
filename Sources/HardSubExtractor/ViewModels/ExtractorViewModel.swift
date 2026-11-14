@@ -103,6 +103,11 @@ final class ExtractorViewModel {
 
     var showsROIOverlay = true { didSet { persistPreferences() } }
 
+    /// 导出前把边界吸附到语音活动边界（AudioEnvelope + SpeechSnapper）
+    var snapToSpeech = true { didSet { persistPreferences() } }
+    /// 导出前应用文本清洗（TextRefiner：标点/空格/缩略语）
+    var refineText = true { didSet { persistPreferences() } }
+
     /// 参数面板是否展开。放模型里而不是视图本地状态，
     /// 是为了 --settings 启动参数和菜单命令都能驱动它。
     var settingsExpanded = false
@@ -121,6 +126,10 @@ final class ExtractorViewModel {
 
     /// 导出成功后的文件位置，状态条提供「在 Finder 中显示」
     var exportedURL: URL?
+    /// 上次中断留下的流水账（载入视频时检测），状态条提供「恢复上次提取」
+    var recoverableSpoolURL: URL?
+    /// 本次提取正在写的流水账
+    @ObservationIgnored private var activeSpool: ExtractionSpool?
 
     private var runTask: Task<Void, Never>?
     private var timeObserver: Any?
@@ -151,6 +160,8 @@ final class ExtractorViewModel {
         roiLeft = d.object(forKey: "roiLeft") as? Double ?? 0.02
         roiRight = d.object(forKey: "roiRight") as? Double ?? 0.98
         showsROIOverlay = d.object(forKey: "showsROIOverlay") as? Bool ?? true
+        snapToSpeech = d.object(forKey: "snapToSpeech") as? Bool ?? true
+        refineText = d.object(forKey: "refineText") as? Bool ?? true
         if let raw = d.string(forKey: "lastExportFormat"), let saved = ExportFormat(rawValue: raw) {
             lastExportFormat = saved
         }
@@ -173,6 +184,8 @@ final class ExtractorViewModel {
         d.set(roiLeft, forKey: "roiLeft")
         d.set(roiRight, forKey: "roiRight")
         d.set(showsROIOverlay, forKey: "showsROIOverlay")
+        d.set(snapToSpeech, forKey: "snapToSpeech")
+        d.set(refineText, forKey: "refineText")
         d.set(lastExportFormat.rawValue, forKey: "lastExportFormat")
     }
 
@@ -268,6 +281,8 @@ final class ExtractorViewModel {
         lastModified = .distantPast
         lastExported = .distantPast
         exportedURL = nil
+        recoverableSpoolURL = ExtractionSpool.findSpool(forVideo: url)
+        activeSpool = nil
         extractionStartedAt = nil
         endROIAdjust()
         currentTime = 0
@@ -408,9 +423,17 @@ final class ExtractorViewModel {
                                           upscale: effectiveUpscale,
                                           decoder: self.decoderKind,
                                           totalDuration: self.videoDuration,
-                                          voteFrames: Int(self.voteFrames))
+                                          voteFrames: Int(self.voteFrames),
+                                          snapToSpeech: self.snapToSpeech,
+                                          refineText: self.refineText)
 
-            let stream = ExtractionEngine.run(url: url, config: config, recognizer: recognizer)
+            // 本次提取建立磁盘流水账（见 ExtractionSpool），中断可从磁盘恢复
+            self.recoverableSpoolURL = nil
+            let spool = ExtractionSpool.create(forVideo: url,
+                                               anchors: self.anchors,
+                                               totalDuration: self.videoDuration)
+            self.activeSpool = spool
+            let stream = ExtractionEngine.run(url: url, config: config, recognizer: recognizer, spool: spool)
 
             for await event in stream {
                 switch event {
@@ -420,6 +443,8 @@ final class ExtractorViewModel {
                 case .observation:
                     self.analyzedFrameCount += 1
                 case .finished(let result, let completed, let note):
+                    self.activeSpool?.closeAndRemove()
+                    self.activeSpool = nil
                     self.segments = result
                     self.markModified()
                     if completed {
@@ -429,6 +454,8 @@ final class ExtractorViewModel {
                     self.phaseText = ""
                     self.extractionStartedAt = nil
                 case .failed(let message):
+                    self.activeSpool?.closeAndRemove()
+                    self.activeSpool = nil
                     self.errorMessage = "「\(self.displayName)」\n\n\(message)"
                     self.statusText = "提取失败"
                     self.extractionStartedAt = nil
@@ -442,7 +469,91 @@ final class ExtractorViewModel {
         runTask?.cancel()
         runTask = nil
         isRunning = false
-        statusText = "已停止"
+
+        // 停止会取消消费端 Task，引擎聚合好的部分结果事件可能来不及送达
+        //（引擎的 cancelled 分支只保证把结果落进流水账）。直接从磁盘恢复，
+        // 保证「已识别的部分」绝不因停止而丢失。
+        guard let spool = activeSpool else {
+            statusText = "已停止"
+            return
+        }
+        activeSpool = nil
+        recoverableSpoolURL = nil
+        statusText = "已停止，正在恢复已识别的结果…"
+        Task { @MainActor [weak self] in
+            // 稍等引擎把收尾观测写完：循环 break 之后它还会给每条锚点补最后一批空观测
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            guard let self else {
+                spool.closeAndRemove()
+                return
+            }
+            // 等待期间用户又开始了新一轮提取：旧流水账文件已被新一轮覆盖，
+            // 这里只关闭句柄，绝不能动文件
+            guard !self.isRunning else {
+                spool.close()
+                return
+            }
+            defer { spool.closeAndRemove() }
+            guard let contents = ExtractionSpool.readContents(from: spool.url),
+                  !contents.observations.isEmpty else {
+                self.statusText = "已停止"
+                return
+            }
+            let recovered = SubtitleAggregator.aggregate(contents.observations,
+                                                         anchors: contents.header.anchors,
+                                                         totalDuration: contents.header.totalDuration)
+            guard !recovered.isEmpty else {
+                self.statusText = "已停止，没有可保留的结果"
+                return
+            }
+            self.segments = recovered
+            self.markModified()
+            self.statusText = "已停止，保留 \(recovered.count) 条部分结果"
+        }
+    }
+
+    /// 状态条「恢复上次提取」：从上次中断留下的流水账聚合出部分结果
+    func recoverFromSpool() {
+        guard !isRunning, let spoolURL = recoverableSpoolURL else { return }
+        recoverableSpoolURL = nil
+        defer { try? FileManager.default.removeItem(at: spoolURL) }
+        guard let contents = ExtractionSpool.readContents(from: spoolURL),
+              !contents.observations.isEmpty else {
+            statusText = "没有可恢复的结果"
+            return
+        }
+        let recovered = SubtitleAggregator.aggregate(contents.observations,
+                                                     anchors: contents.header.anchors,
+                                                     totalDuration: contents.header.totalDuration)
+        guard !recovered.isEmpty else {
+            statusText = "没有可恢复的结果"
+            return
+        }
+        segments = recovered
+        markModified()
+        statusText = "已恢复上次中断的提取，共 \(recovered.count) 条"
+    }
+
+    // MARK: - 更新检查
+
+    /// 有新版本时非 nil，驱动「发现新版本」弹窗
+    var updateRelease: UpdateService.Release?
+    /// 手动检查的反馈文案（启动时的静默检查只在发现新版本时弹窗）
+    var updateNotice: String?
+
+    func checkForUpdate(manual: Bool) {
+        Task { @MainActor [weak self] in
+            let outcome = await UpdateService.checkForUpdate()
+            guard let self else { return }
+            switch outcome {
+            case .updateAvailable(let release):
+                self.updateRelease = release
+            case .upToDate:
+                if manual { self.updateNotice = "已是最新版本（v\(AppVersion.current)）" }
+            case .unavailable:
+                if manual { self.updateNotice = "无法检查更新：网络不可用，或仓库地址尚未配置" }
+            }
+        }
     }
 
     /// 重新检测字幕行：只跑锚点分析，不动已有的识别结果
@@ -709,6 +820,8 @@ final class ExtractorViewModel {
         hashThreshold = 4
         upscale = 1.6
         voteFrames = 3
+        snapToSpeech = true
+        refineText = true
         anchors = []
     }
 

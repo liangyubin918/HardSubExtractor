@@ -172,5 +172,11 @@ struct AppCommands: Commands {
             }
             .disabled(model?.exportableSegments.isEmpty != false)
         }
+
+        CommandGroup(after: .help) {
+            Button("检查更新…") {
+                model?.checkForUpdate(manual: true)
+            }
+        }
     }
 }

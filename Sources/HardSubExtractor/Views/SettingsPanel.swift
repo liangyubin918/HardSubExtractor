@@ -202,6 +202,8 @@ struct SettingsPanel: View {
             Toggle("英文", isOn: $model.useEnglish)
             Toggle("语言纠正", isOn: $model.usesLanguageCorrection)
             Toggle("导出时过滤疑似水印", isOn: $model.filterWatermarks)
+            Toggle("按语音吸附时间轴", isOn: $model.snapToSpeech)
+            Toggle("清洗标点与空格", isOn: $model.refineText)
 
             HStack(spacing: 10) {
                 Button("恢复默认") { model.resetSettings() }

@@ -65,7 +65,66 @@ enum CommandLineRunner {
                               roi: roi, fps: fps, engineName: engineName,
                               upscaleOverride: parseValue(args, flag: "--upscale").map { CGFloat($0) },
                               voteFrames: Int(parseValue(args, flag: "--votes") ?? 3),
-                              verbose: args.contains("--verbose"))
+                              verbose: args.contains("--verbose"),
+                              snapToSpeech: !args.contains("--no-snap"),
+                              refineText: !args.contains("--no-refine"))
+            }
+            return true
+
+        case "--recover":
+            guard args.count >= 3 else {
+                print("用法：HardSubExtractor --recover <流水账.jsonl 或 视频路径> [输出.srt]")
+                return true
+            }
+            let inputPath = args[2]
+            let outputPath = args.count >= 4 && !args[3].hasPrefix("--") ? args[3] : nil
+            runBlocking {
+                await recover(path: inputPath, outputPath: outputPath)
+            }
+            return true
+
+        case "--refine-text":
+            guard args.count >= 3 else {
+                print("用法：HardSubExtractor --refine-text <文本>")
+                return true
+            }
+            print(TextRefiner.refine(args.dropFirst(2).joined(separator: " ")))
+            return true
+
+        case "--probe-audio":
+            guard args.count >= 3 else {
+                print("用法：HardSubExtractor --probe-audio <视频>")
+                return true
+            }
+            runBlocking {
+                let url = URL(fileURLWithPath: args[2])
+                guard let envelope = await AudioEnvelope.load(url: url) else {
+                    print("包络不可用（无音轨 / ffmpeg 失败）")
+                    return
+                }
+                let speech = SpeechSnapper.speechSegments(from: envelope)
+                print(String(format: "包络 %.1fs（%d 个能量点）", envelope.totalDuration, envelope.decibels.count))
+                print(String(format: "dB min=%.1f max=%.1f",
+                             envelope.decibels.min() ?? 0, envelope.decibels.max() ?? 0))
+                print("语音段 \(speech.count) 个：")
+                for segment in speech.prefix(12) {
+                    print(String(format: "  %.3f → %.3f", segment.start, segment.end))
+                }
+            }
+            return true
+
+        case "--check-update":
+            runBlocking {
+                let outcome = await UpdateService.checkForUpdate()
+                switch outcome {
+                case .upToDate:
+                    print("已是最新版本（v\(AppVersion.current)）")
+                case .updateAvailable(let release):
+                    print("发现新版本：\(release.version)（当前 v\(AppVersion.current)）")
+                    print("下载页：\(UpdateService.releasesPageURL.absoluteString)")
+                case .unavailable:
+                    print("无法检查更新：网络不可用，或仓库还没有发布 Release")
+                }
             }
             return true
 
@@ -128,13 +187,30 @@ enum CommandLineRunner {
             HardSubExtractor — 硬字幕提取
 
               --make-sample <输出.mp4>              生成带硬字幕的合成测试视频
-              --extract <视频> [输出.srt] [选项]     提取字幕并写出 SRT
+              --extract <视频> [输出.srt]            提取字幕并写出 SRT（省略输出则打印到终端）
+              --recover <流水账|视频> [输出.srt]      从中断留下的流水账恢复部分结果
+              --probe <视频> [秒]                    单帧探测：取帧 → 裁剪 → OCR，输出中间量
+              --frame <视频> <秒> [输出.png]         抽出单帧存成 PNG
+              --selftest <视频>                      无界面驱动 GUI 的 ViewModel，验证交互路径
+              --render-ui [输出.png]                 离屏渲染界面快照（布局自检）
+              --refine-text <文本>                   打印文本清洗（TextRefiner）结果
+              --probe-audio <视频>                   检查音频包络与语音段检测（语音吸附调参用）
+              --check-update                         检查 GitHub Releases 上的新版本
 
-              选项：
-                --roi <top,bottom>    字幕区域纵向范围，默认 0.58,1.00
-                --interval <秒>       抽帧最小间隔，默认 0.10
+              --extract 选项：
+                --engine vision|paddle   OCR 引擎，默认 vision
+                --fps <帧率>             采样帧率，默认 10
+                --interval <秒>          抽帧最小间隔（兼容旧参数，换算成帧率）
+                --roi <top,bottom>       字幕区域纵向范围，默认 0.58,1.00
+                --upscale <倍数>         OCR 前放大倍数（默认 Vision 1.6 / Paddle 1.0）
+                --votes <帧数>           变化后补投几帧，默认 3
+                --no-snap                关闭语音边界吸附
+                --no-refine              关闭文本清洗
+                --verbose                打印每条观测
 
-              不带参数启动则进入图形界面。
+              --make-sample 风格：--hard --tiny --faint --bilingual --dense，--duration <秒>
+
+              不带参数启动则进入图形界面；--gui <视频> [--autorun] [--play] [--settings] 驱动 GUI。
             """)
             return true
 
@@ -152,7 +228,9 @@ enum CommandLineRunner {
                                 engineName: String,
                                 upscaleOverride: CGFloat?,
                                 voteFrames: Int,
-                                verbose: Bool) async {
+                                verbose: Bool,
+                                snapToSpeech: Bool,
+                                refineText: Bool) async {
         // 进度回调是 @Sendable，用带锁的小盒子做节流，避免捕获可变局部变量
         final class AnalyzeThrottle: @unchecked Sendable {
             private var last = -1
@@ -238,12 +316,22 @@ enum CommandLineRunner {
                                       upscale: upscale,
                                       decoder: probe.decoder,
                                       totalDuration: probe.duration,
-                                      voteFrames: voteFrames)
+                                      voteFrames: voteFrames,
+                                      snapToSpeech: snapToSpeech,
+                                      refineText: refineText)
+
+        // 提取全程写磁盘流水账：进程被杀也能用 --recover 从磁盘聚合出部分结果
+        let spool = ExtractionSpool.create(forVideo: url,
+                                           anchors: detected.anchors,
+                                           totalDuration: probe.duration)
+        if let spool {
+            print("流水账：\(spool.url.path)")
+        }
 
         var segments: [SubtitleSegment] = []
         var lastReported = -1
 
-        for await event in ExtractionEngine.run(url: url, config: config, recognizer: recognizer) {
+        for await event in ExtractionEngine.run(url: url, config: config, recognizer: recognizer, spool: spool) {
             switch event {
             case .progress(let value, let text):
                 let bucket = Int(value * 10)
@@ -284,10 +372,55 @@ enum CommandLineRunner {
         }
     }
 
+    // MARK: - 从流水账恢复
+
+    /// 从中断留下的磁盘流水账聚合出部分结果。
+    /// 参数可以是 spool 文件本身，也可以是视频路径（自动找同目录的 <stem>.hsub-partial.jsonl）。
+    private static func recover(path: String, outputPath: String?) async {
+        let inputURL = URL(fileURLWithPath: path)
+        let spoolURL: URL?
+        if path.hasSuffix(".jsonl"), FileManager.default.fileExists(atPath: inputURL.path) {
+            spoolURL = inputURL
+        } else {
+            spoolURL = ExtractionSpool.findSpool(forVideo: inputURL)
+        }
+        guard let spoolURL,
+              let contents = ExtractionSpool.readContents(from: spoolURL),
+              !contents.observations.isEmpty else {
+            print("没有找到可恢复的流水账：\(path)")
+            return
+        }
+
+        print("流水账：\(spoolURL.path)")
+        print("锚点 \(contents.header.anchors.count) 条，观测 \(contents.observations.count) 条")
+        let segments = SubtitleAggregator.aggregate(contents.observations,
+                                                    anchors: contents.header.anchors,
+                                                    totalDuration: contents.header.totalDuration)
+        guard !segments.isEmpty else {
+            print("流水账里的观测聚合不出字幕（可能是刚开始就被中断了）")
+            return
+        }
+
+        let srt = SubtitleExporter.srt(segments)
+        if let outputPath {
+            do {
+                try srt.write(to: URL(fileURLWithPath: outputPath), atomically: true, encoding: .utf8)
+                print("已写出：\(outputPath)")
+                // 恢复成功后流水账就算消费掉了
+                try? FileManager.default.removeItem(at: spoolURL)
+            } catch {
+                print("写出失败：\(error.localizedDescription)")
+            }
+        } else {
+            print("聚合得到 \(segments.count) 条字幕")
+            print("---- SRT ----")
+            print(srt)
+        }
+    }
+
     // MARK: - 参数解析
 
-    private static func parseValue(_ args: [String], flag: String) -> Double? {
-        guard let index = args.firstIndex(of: flag), index + 1 < args.count else { return nil }
+    private static func parseValue(_ args: [String], flag: String) -> Double? {        guard let index = args.firstIndex(of: flag), index + 1 < args.count else { return nil }
         return Double(args[index + 1])
     }
 

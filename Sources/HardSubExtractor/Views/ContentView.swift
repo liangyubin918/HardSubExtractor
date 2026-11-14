@@ -37,6 +37,27 @@ struct ContentView: View {
             } message: {
                 Text(model.errorMessage ?? "")
             }
+            .alert("发现新版本", isPresented: updateReleaseBinding) {
+                Button("前往下载页") {
+                    NSWorkspace.shared.open(UpdateService.releasesPageURL)
+                }
+                Button("取消", role: .cancel) { model.updateRelease = nil }
+            } message: {
+                Text("最新版本 \(model.updateRelease?.version ?? "")，当前 v\(AppVersion.current)。")
+            }
+            .alert("检查更新", isPresented: updateNoticeBinding) {
+                Button("好", role: .cancel) { model.updateNotice = nil }
+            } message: {
+                Text(model.updateNotice ?? "")
+            }
+            .task {
+                // 启动检查更新：默认关闭（UserDefaults 键 checkUpdateOnStartup）。
+                // 延迟 2 秒避开载入高峰；静默模式，只有发现新版本才弹窗。
+                if UserDefaults.standard.object(forKey: "checkUpdateOnStartup") as? Bool ?? false {
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    model.checkForUpdate(manual: false)
+                }
+            }
             .task {
                 // 开发用：--gui <视频> [--autorun] 免点击驱动
                 guard let url = LaunchOptions.initialVideo, !model.hasVideo else { return }
@@ -58,6 +79,16 @@ struct ContentView: View {
     private var errorBinding: Binding<Bool> {
         Binding(get: { model.errorMessage != nil },
                 set: { if !$0 { model.errorMessage = nil } })
+    }
+
+    private var updateReleaseBinding: Binding<Bool> {
+        Binding(get: { model.updateRelease != nil },
+                set: { if !$0 { model.updateRelease = nil } })
+    }
+
+    private var updateNoticeBinding: Binding<Bool> {
+        Binding(get: { model.updateNotice != nil },
+                set: { if !$0 { model.updateNotice = nil } })
     }
 
     // 工具栏按工作流排列：打开 → 提取 → 导出，一个动作簇。
@@ -431,6 +462,17 @@ struct PlayerPane: View {
                     .truncationMode(.middle)
 
                 Spacer(minLength: 10)
+
+                if !model.isRunning, let _ = model.recoverableSpoolURL {
+                    Button {
+                        model.recoverFromSpool()
+                    } label: {
+                        Label("恢复上次提取", systemImage: "arrow.clockwise.circle")
+                    }
+                    .buttonStyle(.borderless)
+                    .font(Theme.meta)
+                    .help("从上次中断留下的流水账恢复已识别结果")
+                }
 
                 if let exportedURL = model.exportedURL {
                     Button {

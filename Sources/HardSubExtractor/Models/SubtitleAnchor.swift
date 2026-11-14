@@ -57,7 +57,9 @@ enum SubtitleLanguage: String, Codable, CaseIterable {
 /// 1. 每行独立判重，一行变了不会连带另一行重新识别；
 /// 2. 双语字幕天然是两条锚点，输出成两条独立文本而不是用换行拼在一起；
 /// 3. 每行单独记录宽度统计，用来判断检测框是不是真的字幕（而不是画面里的招牌）。
-struct SubtitleAnchor: Identifiable, Hashable {
+/// Codable 用于提取过程的磁盘流水账（ExtractionSpool）：锚点定义随 header 落盘，
+/// 中断恢复时聚合不需要重新扫描片头。
+struct SubtitleAnchor: Identifiable, Hashable, Codable {
     var id = UUID()
     /// 归一化坐标，左上原点
     var rect: CGRect
